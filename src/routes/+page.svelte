@@ -94,7 +94,13 @@
 
 	async function handleFiles(files: FileList | null) {
 		if (!files || !peer?.connected) return;
-		for (const file of files) {
+		const validFiles = Array.from(files).filter(f => f.size > 0 || f.type !== '');
+		if (validFiles.length === 0) {
+			error = 'Folders are not supported — please select individual files (or zip the folder first)';
+			return;
+		}
+		error = '';
+		for (const file of validFiles) {
 			sendProgress = { fileName: file.name, total: file.size, received: 0, done: false };
 			await peer.sendFile(file);
 			sendProgress = { fileName: file.name, total: file.size, received: file.size, done: true };
@@ -216,7 +222,7 @@
 						<div class="code-display">
 							<span class="code-text">{roomCode}</span>
 							<button class="bw icon-sq" onclick={copyCode} title="Copy code">
-								<svg width="11" height="11" viewBox="0 0 11 11"><path d="M7 .5H3.5A1.5 1.5 0 002 2v6M4.5 3H9a1.5 1.5 0 011.5 1.5v4.5A1.5 1.5 0 019 10.5H4.5A1.5 1.5 0 013 9V4.5A1.5 1.5 0 014.5 3z" stroke="currentColor" fill="none" stroke-width=".9"/></svg>
+								<svg class="copy-icon" width="11" height="11" viewBox="0 0 11 11"><path d="M7 .5H3.5A1.5 1.5 0 002 2v6M4.5 3H9a1.5 1.5 0 011.5 1.5v4.5A1.5 1.5 0 019 10.5H4.5A1.5 1.5 0 013 9V4.5A1.5 1.5 0 014.5 3z" stroke="currentColor" fill="none" stroke-width=".9"/></svg>
 							</button>
 						</div>
 						<div class="spinner-row">
@@ -782,6 +788,7 @@
 		.code-display { padding: 14px; }
 		.code-text { font-size: 26px; letter-spacing: 8px; }
 		.icon-sq { width: 36px; height: 36px; }
+		.copy-icon { width: 18px; height: 18px; }
 
 		.spinner-row { font-size: 13px; gap: 10px; }
 		.spinner { width: 16px; height: 16px; }
