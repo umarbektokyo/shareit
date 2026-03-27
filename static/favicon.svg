@@ -1,12 +1,31 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none">
-  <rect width="32" height="32" rx="4" fill="#E87D0D"/>
-  <rect x="6" y="6" width="20" height="20" rx="2" fill="#2D2D2D"/>
-  <!-- Left node -->
-  <circle cx="11" cy="16" r="2.5" fill="#E87D0D"/>
-  <!-- Right top node -->
-  <circle cx="21" cy="11.5" r="2.5" fill="#E87D0D"/>
-  <!-- Right bottom node -->
-  <circle cx="21" cy="20.5" r="2.5" fill="#E87D0D"/>
-  <!-- Connection lines -->
-  <path d="M13.2 15l5.3-2.8M13.2 17l5.3 2.8" stroke="#E87D0D" stroke-width="1.3" stroke-linecap="round" opacity="0.7"/>
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg width="100%" height="100%" viewBox="0 0 1024 1024" version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xml:space="preserve" xmlns:serif="http://www.serif.com/" style="fill-rule:evenodd;clip-rule:evenodd;stroke-linecap:round;">
+    <g transform="matrix(1,0,0,1,-3222,0)">
+        <rect id="shareit" x="3222" y="0" width="1024" height="1024" style="fill:rgb(35,35,35);"/>
+        <g id="shareit1" serif:id="shareit">
+            <g transform="matrix(5.605,0,0,5.605,3734,512)">
+                <g transform="matrix(1,0,0,1,-66.666667,-66.666667)">
+                    <g transform="matrix(4.166667,0,0,4.166667,0,0)">
+                        <path d="M32,4L32,28C32,30.208 30.208,32 28,32L4,32C1.792,32 0,30.208 0,28L0,4C0,1.792 1.792,0 4,0L28,0C30.208,0 32,1.792 32,4Z" style="fill:rgb(232,125,13);"/>
+                    </g>
+                    <g transform="matrix(4.166667,0,0,4.166667,0,0)">
+                        <path d="M26,8L26,24C26,25.104 25.104,26 24,26L8,26C6.896,26 6,25.104 6,24L6,8C6,6.896 6.896,6 8,6L24,6C25.104,6 26,6.896 26,8Z" style="fill:rgb(45,45,45);"/>
+                    </g>
+                    <g transform="matrix(4.166667,0,0,4.166667,0,0)">
+                        <circle cx="11" cy="16" r="2.5" style="fill:rgb(232,125,13);"/>
+                    </g>
+                    <g transform="matrix(4.166667,0,0,4.166667,0,0)">
+                        <circle cx="21" cy="11.5" r="2.5" style="fill:rgb(232,125,13);"/>
+                    </g>
+                    <g transform="matrix(4.166667,0,0,4.166667,0,0)">
+                        <circle cx="21" cy="20.5" r="2.5" style="fill:rgb(232,125,13);"/>
+                    </g>
+                    <g transform="matrix(4.166667,0,0,4.166667,0,0)">
+                        <path d="M13.2,15L18.5,12.2M13.2,17L18.5,19.8" style="fill:none;fill-rule:nonzero;stroke:rgb(232,125,13);stroke-opacity:0.7;stroke-width:1.3px;"/>
+                    </g>
+                </g>
+            </g>
+        </g>
+    </g>
 </svg>

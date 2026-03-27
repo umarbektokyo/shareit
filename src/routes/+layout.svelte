@@ -19,8 +19,8 @@
 	<meta property="og:type" content="website" />
 	<meta property="og:url" content="https://github.com/umarbektokyo/shareit" />
 	<meta property="og:image" content="https://shareit.umarbek.dev/og.png" />
-	<meta property="og:image:width" content="1200" />
-	<meta property="og:image:height" content="630" />
+	<meta property="og:image:width" content="1024" />
+	<meta property="og:image:height" content="1024" />
 	<meta property="og:image:alt" content="ShareIt — Peer-to-peer file transfer in the browser" />
 	<meta property="og:site_name" content="ShareIt" />
 
