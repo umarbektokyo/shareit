@@ -1,0 +1,11 @@
+node_modules
+build
+.svelte-kit
+.git
+.gitignore
+.vscode
+.claude
+.DS_Store
+README.md
+LICENSE
+Makefile
