@@ -26,7 +26,20 @@ function createSignalingServer(port: number) {
 	wss.on('connection', (ws) => {
 		let currentRoom: string | null = null;
 
-		ws.on('message', (raw) => {
+		ws.on('message', (raw, isBinary) => {
+			// Binary relay
+			if (isBinary) {
+				if (!currentRoom) return;
+				const room = rooms.get(currentRoom);
+				if (!room) return;
+				for (const peer of room) {
+					if (peer !== ws && peer.readyState === WebSocket.OPEN) {
+						peer.send(raw, { binary: true });
+					}
+				}
+				return;
+			}
+
 			let msg: any;
 			try { msg = JSON.parse(raw.toString()); } catch { return; }
 
@@ -51,7 +64,9 @@ function createSignalingServer(port: number) {
 				}
 				case 'offer':
 				case 'answer':
-				case 'ice-candidate': {
+				case 'ice-candidate':
+				case 'relay-meta':
+				case 'relay-end': {
 					if (!currentRoom) break;
 					const room = rooms.get(currentRoom);
 					if (!room) break;
@@ -90,6 +105,33 @@ function waitMessage(ws: WebSocket): Promise<any> {
 	return new Promise((resolve) => {
 		ws.once('message', (data) => resolve(JSON.parse(data.toString())));
 	});
+}
+
+function waitBinaryMessage(ws: WebSocket): Promise<Buffer> {
+	return new Promise((resolve) => {
+		ws.on('message', (data, isBinary) => {
+			if (isBinary) {
+				ws.removeAllListeners('message');
+				resolve(data as Buffer);
+			}
+		});
+	});
+}
+
+async function createJoinedRoom(port: number): Promise<{ ws1: WebSocket; ws2: WebSocket; code: string }> {
+	const ws1 = await connectWs(port);
+	const createP = waitMessage(ws1);
+	ws1.send(JSON.stringify({ type: 'create' }));
+	const { code } = await createP;
+
+	const ws2 = await connectWs(port);
+	const joinP1 = waitMessage(ws1);
+	const joinP2 = waitMessage(ws2);
+	ws2.send(JSON.stringify({ type: 'join', code }));
+	await joinP1;
+	await joinP2;
+
+	return { ws1, ws2, code };
 }
 
 const PORT = 9876;
@@ -290,6 +332,66 @@ describe('Signaling Server', () => {
 
 		expect(ice.type).toBe('ice-candidate');
 		expect(ice.candidate.candidate).toBe('fake');
+
+		ws1.close();
+		ws2.close();
+	});
+
+	it('relays relay-meta and relay-end messages', async () => {
+		const { ws1, ws2 } = await createJoinedRoom(PORT);
+
+		const metaP = waitMessage(ws2);
+		ws1.send(JSON.stringify({ type: 'relay-meta', name: 'test.txt', size: 5, mimeType: 'text/plain' }));
+		const meta = await metaP;
+
+		expect(meta.type).toBe('relay-meta');
+		expect(meta.name).toBe('test.txt');
+		expect(meta.size).toBe(5);
+
+		const endP = waitMessage(ws2);
+		ws1.send(JSON.stringify({ type: 'relay-end' }));
+		const end = await endP;
+
+		expect(end.type).toBe('relay-end');
+
+		ws1.close();
+		ws2.close();
+	});
+
+	it('relays binary frames between peers', async () => {
+		const { ws1, ws2 } = await createJoinedRoom(PORT);
+
+		const binaryP = waitBinaryMessage(ws2);
+		const payload = Buffer.from('hello world');
+		ws1.send(payload);
+		const received = await binaryP;
+
+		expect(Buffer.compare(received, payload)).toBe(0);
+
+		ws1.close();
+		ws2.close();
+	});
+
+	it('completes a full relay file transfer', async () => {
+		const { ws1, ws2 } = await createJoinedRoom(PORT);
+
+		// Send metadata
+		const metaP = waitMessage(ws2);
+		ws1.send(JSON.stringify({ type: 'relay-meta', name: 'photo.png', size: 11, mimeType: 'image/png' }));
+		await metaP;
+
+		// Send binary chunk
+		const binaryP = waitBinaryMessage(ws2);
+		const chunk = Buffer.from('hello world');
+		ws1.send(chunk);
+		const received = await binaryP;
+		expect(received.length).toBe(11);
+
+		// Send end
+		const endP = waitMessage(ws2);
+		ws1.send(JSON.stringify({ type: 'relay-end' }));
+		const end = await endP;
+		expect(end.type).toBe('relay-end');
 
 		ws1.close();
 		ws2.close();

@@ -7,13 +7,23 @@ export type SignalMessage =
 	| { type: 'error'; message: string }
 	| { type: 'offer'; sdp: RTCSessionDescriptionInit }
 	| { type: 'answer'; sdp: RTCSessionDescriptionInit }
-	| { type: 'ice-candidate'; candidate: RTCIceCandidateInit };
+	| { type: 'ice-candidate'; candidate: RTCIceCandidateInit }
+	| { type: 'relay-meta'; name: string; size: number; mimeType: string }
+	| { type: 'relay-end' };
 
-export function createSignaling(onMessage: (msg: SignalMessage) => void) {
+export function createSignaling(
+	onMessage: (msg: SignalMessage) => void,
+	onBinary?: (data: ArrayBuffer) => void
+) {
 	const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
 	const ws = new WebSocket(`${proto}//${location.host}/ws`);
+	ws.binaryType = 'arraybuffer';
 
 	ws.onmessage = (e) => {
+		if (e.data instanceof ArrayBuffer) {
+			onBinary?.(e.data);
+			return;
+		}
 		try {
 			onMessage(JSON.parse(e.data));
 		} catch { /* ignore */ }
@@ -22,6 +32,12 @@ export function createSignaling(onMessage: (msg: SignalMessage) => void) {
 	function send(msg: SignalMessage) {
 		if (ws.readyState === WebSocket.OPEN) {
 			ws.send(JSON.stringify(msg));
+		}
+	}
+
+	function sendBinary(data: ArrayBuffer) {
+		if (ws.readyState === WebSocket.OPEN) {
+			ws.send(data);
 		}
 	}
 
@@ -35,6 +51,7 @@ export function createSignaling(onMessage: (msg: SignalMessage) => void) {
 
 	return {
 		send,
+		sendBinary,
 		waitOpen,
 		close: () => ws.close(),
 		get ready() { return ws.readyState === WebSocket.OPEN; }

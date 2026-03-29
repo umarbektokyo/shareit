@@ -29,7 +29,20 @@ wss.on('connection', (ws) => {
 
 	let currentRoom = null;
 
-	ws.on('message', (raw) => {
+	ws.on('message', (raw, isBinary) => {
+		// Binary frame: relay to the other peer in the room
+		if (isBinary) {
+			if (!currentRoom) return;
+			const room = rooms.get(currentRoom);
+			if (!room) return;
+			for (const peer of room) {
+				if (peer !== ws && peer.readyState === 1) {
+					peer.send(raw, { binary: true });
+				}
+			}
+			return;
+		}
+
 		let msg;
 		try { msg = JSON.parse(raw.toString()); } catch { return; }
 
@@ -63,10 +76,12 @@ wss.on('connection', (ws) => {
 				break;
 			}
 
-			// WebRTC signaling relay
+			// WebRTC signaling + relay control messages
 			case 'offer':
 			case 'answer':
-			case 'ice-candidate': {
+			case 'ice-candidate':
+			case 'relay-meta':
+			case 'relay-end': {
 				if (!currentRoom) break;
 				const room = rooms.get(currentRoom);
 				if (!room) break;

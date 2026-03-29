@@ -1,7 +1,9 @@
 <script lang="ts">
 	import { createSignaling, type SignalMessage } from '$lib/signaling';
-	import { createPeerConnection, type TransferProgress } from '$lib/peer';
+	import { createPeerConnection, type TransferProgress, type FileMetadata } from '$lib/peer';
 	import { onMount } from 'svelte';
+
+	const CHUNK_SIZE = 64 * 1024;
 
 	type State = 'idle' | 'waiting' | 'connecting' | 'connected' | 'disconnected';
 
@@ -13,16 +15,31 @@
 	let sendProgress = $state<TransferProgress | null>(null);
 	let recvProgress = $state<TransferProgress | null>(null);
 	let isDragging = $state(false);
+	let relayMode = $state(false);
 
 	let signaling: ReturnType<typeof createSignaling> | null = null;
 	let peer: ReturnType<typeof createPeerConnection> | null = null;
 	let isInitiator = false;
+
+	// Relay receive state
+	let relayMeta: FileMetadata | null = null;
+	let relayChunks: ArrayBuffer[] = [];
+	let relayReceived = 0;
 
 	function cleanup() {
 		peer?.destroy();
 		signaling?.close();
 		peer = null;
 		signaling = null;
+		relayMode = false;
+	}
+
+	function handleRelayBinary(data: ArrayBuffer) {
+		relayChunks.push(data);
+		relayReceived += data.byteLength;
+		if (relayMeta) {
+			recvProgress = { fileName: relayMeta.name, total: relayMeta.size, received: relayReceived, done: false };
+		}
 	}
 
 	function handleSignalMessage(msg: SignalMessage) {
@@ -34,14 +51,18 @@
 			case 'peer-joined':
 				if (msg.count === 2) {
 					state = 'connecting';
-					// Create peer connection — initiator (creator) makes the offer
 					peer = createPeerConnection(
 						isInitiator,
 						(m) => signaling?.send(m),
 						handleReceivedFile,
 						handleRecvProgress,
 						() => { state = 'connected'; },
-						() => { state = 'disconnected'; }
+						() => { state = 'disconnected'; },
+						() => {
+							// P2P failed — fall back to relay through server
+							relayMode = true;
+							state = 'connected';
+						}
 					);
 					if (isInitiator) peer.createOffer();
 				}
@@ -59,6 +80,24 @@
 			case 'ice-candidate':
 				peer?.handleSignal(msg);
 				break;
+			// Relay file transfer messages
+			case 'relay-meta':
+				relayMeta = { name: msg.name, size: msg.size, mimeType: msg.mimeType };
+				relayChunks = [];
+				relayReceived = 0;
+				recvProgress = { fileName: msg.name, total: msg.size, received: 0, done: false };
+				break;
+			case 'relay-end':
+				if (relayMeta) {
+					const blob = new Blob(relayChunks, { type: relayMeta.mimeType || 'application/octet-stream' });
+					const file = new File([blob], relayMeta.name, { type: blob.type });
+					recvProgress = null;
+					handleReceivedFile(file);
+					relayMeta = null;
+					relayChunks = [];
+					relayReceived = 0;
+				}
+				break;
 		}
 	}
 
@@ -74,7 +113,7 @@
 	async function createRoom() {
 		error = '';
 		isInitiator = true;
-		signaling = createSignaling(handleSignalMessage);
+		signaling = createSignaling(handleSignalMessage, handleRelayBinary);
 		await signaling.waitOpen();
 		signaling.send({ type: 'create' });
 	}
@@ -87,13 +126,35 @@
 			return;
 		}
 		isInitiator = false;
-		signaling = createSignaling(handleSignalMessage);
+		signaling = createSignaling(handleSignalMessage, handleRelayBinary);
 		await signaling.waitOpen();
 		signaling.send({ type: 'join', code });
 	}
 
+	async function sendFileViaRelay(file: File) {
+		if (!signaling?.ready) return;
+		signaling.send({ type: 'relay-meta', name: file.name, size: file.size, mimeType: file.type });
+
+		let offset = 0;
+		while (offset < file.size) {
+			const slice = file.slice(offset, offset + CHUNK_SIZE);
+			const buffer = await slice.arrayBuffer();
+			signaling.sendBinary(buffer);
+			offset += buffer.byteLength;
+			// Small yield to avoid blocking the UI
+			if (offset % (CHUNK_SIZE * 16) === 0) {
+				await new Promise((r) => setTimeout(r, 0));
+			}
+		}
+
+		signaling.send({ type: 'relay-end' });
+	}
+
 	async function handleFiles(files: FileList | null) {
-		if (!files || !peer?.connected) return;
+		if (!files) return;
+		if (!relayMode && !peer?.connected) return;
+		if (relayMode && !signaling?.ready) return;
+
 		const validFiles = Array.from(files).filter(f => f.size > 0 || f.type !== '');
 		if (validFiles.length === 0) {
 			error = 'Folders are not supported — please select individual files (or zip the folder first)';
@@ -102,7 +163,11 @@
 		error = '';
 		for (const file of validFiles) {
 			sendProgress = { fileName: file.name, total: file.size, received: 0, done: false };
-			await peer.sendFile(file);
+			if (relayMode) {
+				await sendFileViaRelay(file);
+			} else {
+				await peer!.sendFile(file);
+			}
 			sendProgress = { fileName: file.name, total: file.size, received: file.size, done: true };
 			setTimeout(() => { sendProgress = null; }, 1500);
 		}
@@ -256,7 +321,7 @@
 				<!-- Status bar -->
 				<div class="status-bar">
 					<div class="status-dot connected"></div>
-					<span>Connected to peer</span>
+					<span>Connected to peer{relayMode ? ' (relayed)' : ' (P2P)'}</span>
 					<span class="status-code">Room: {roomCode || joinInput.toUpperCase()}</span>
 				</div>
 

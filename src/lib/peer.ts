@@ -21,7 +21,8 @@ export function createPeerConnection(
 	onFile: (file: File) => void,
 	onProgress: (progress: TransferProgress) => void,
 	onConnected: () => void,
-	onDisconnected: () => void
+	onDisconnected: () => void,
+	onP2PFailed: () => void
 ) {
 	const config: RTCConfiguration = {
 		iceServers: [
@@ -29,6 +30,12 @@ export function createPeerConnection(
 			{ urls: 'stun:stun1.l.google.com:19302' }
 		]
 	};
+
+	// If WebRTC doesn't connect in 5s, fall back to relay
+	let connected = false;
+	const timeout = setTimeout(() => {
+		if (!connected) onP2PFailed();
+	}, 5000);
 
 	const pc = new RTCPeerConnection(config);
 	let dataChannel: RTCDataChannel | null = null;
@@ -42,7 +49,7 @@ export function createPeerConnection(
 		dataChannel = ch;
 		ch.binaryType = 'arraybuffer';
 
-		ch.onopen = () => onConnected();
+		ch.onopen = () => { connected = true; clearTimeout(timeout); onConnected(); };
 		ch.onclose = () => onDisconnected();
 
 		ch.onmessage = (e) => {
@@ -137,6 +144,7 @@ export function createPeerConnection(
 	}
 
 	function destroy() {
+		clearTimeout(timeout);
 		dataChannel?.close();
 		pc.close();
 	}
