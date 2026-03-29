@@ -42,14 +42,20 @@ export function createPeerConnection(
 
 	// Incoming file assembly state
 	let incomingMeta: FileMetadata | null = null;
-	let incomingChunks: ArrayBuffer[] = [];
+	let incomingChunks: (Blob | ArrayBuffer)[] = [];
 	let incomingReceived = 0;
+	const FLUSH_THRESHOLD = 32 * 1024 * 1024;
+	let unflushedSize = 0;
 
 	function setupChannel(ch: RTCDataChannel) {
 		dataChannel = ch;
 		ch.binaryType = 'arraybuffer';
 
-		ch.onopen = () => { connected = true; clearTimeout(timeout); onConnected(); };
+		ch.onopen = () => {
+			connected = true;
+			clearTimeout(timeout);
+			onConnected();
+		};
 		ch.onclose = () => onDisconnected();
 
 		ch.onmessage = (e) => {
@@ -59,24 +65,45 @@ export function createPeerConnection(
 					incomingMeta = msg;
 					incomingChunks = [];
 					incomingReceived = 0;
+					unflushedSize = 0;
 					onProgress({ fileName: msg.name, total: msg.size, received: 0, done: false });
 				} else if (msg.type === 'file-end') {
 					if (incomingMeta) {
-						const blob = new Blob(incomingChunks, { type: incomingMeta.mimeType || 'application/octet-stream' });
+						const blob = new Blob(incomingChunks, {
+							type: incomingMeta.mimeType || 'application/octet-stream'
+						});
 						const file = new File([blob], incomingMeta.name, { type: blob.type });
-						onProgress({ fileName: incomingMeta.name, total: incomingMeta.size, received: incomingMeta.size, done: true });
+						onProgress({
+							fileName: incomingMeta.name,
+							total: incomingMeta.size,
+							received: incomingMeta.size,
+							done: true
+						});
 						onFile(file);
 						incomingMeta = null;
 						incomingChunks = [];
 						incomingReceived = 0;
+						unflushedSize = 0;
 					}
 				}
 			} else {
 				// Binary chunk
 				incomingChunks.push(e.data);
 				incomingReceived += e.data.byteLength;
+				unflushedSize += e.data.byteLength;
+				// Periodically flush chunks into a single Blob to reduce memory pressure
+				if (unflushedSize >= FLUSH_THRESHOLD) {
+					const flushed = new Blob(incomingChunks);
+					incomingChunks = [flushed];
+					unflushedSize = 0;
+				}
 				if (incomingMeta) {
-					onProgress({ fileName: incomingMeta.name, total: incomingMeta.size, received: incomingReceived, done: false });
+					onProgress({
+						fileName: incomingMeta.name,
+						total: incomingMeta.size,
+						received: incomingReceived,
+						done: false
+					});
 				}
 			}
 		};
@@ -114,33 +141,35 @@ export function createPeerConnection(
 		}
 	}
 
-	async function sendFile(file: File) {
+	async function sendFile(file: File, onSendProgress?: (progress: TransferProgress) => void) {
 		if (!dataChannel || dataChannel.readyState !== 'open') return;
 
-		// Send metadata
-		dataChannel.send(JSON.stringify({
-			type: 'file-meta',
-			name: file.name,
-			size: file.size,
-			mimeType: file.type
-		}));
+		dataChannel.send(
+			JSON.stringify({
+				type: 'file-meta',
+				name: file.name,
+				size: file.size,
+				mimeType: file.type
+			})
+		);
 
-		// Send chunks
 		let offset = 0;
+		onSendProgress?.({ fileName: file.name, total: file.size, received: 0, done: false });
 		while (offset < file.size) {
 			const slice = file.slice(offset, offset + CHUNK_SIZE);
 			const buffer = await slice.arrayBuffer();
 
-			// Backpressure: wait if buffered amount is too high
 			while (dataChannel.bufferedAmount > 2 * 1024 * 1024) {
 				await new Promise((r) => setTimeout(r, 20));
 			}
 
 			dataChannel.send(buffer);
 			offset += buffer.byteLength;
+			onSendProgress?.({ fileName: file.name, total: file.size, received: offset, done: false });
 		}
 
 		dataChannel.send(JSON.stringify({ type: 'file-end' }));
+		onSendProgress?.({ fileName: file.name, total: file.size, received: file.size, done: true });
 	}
 
 	function destroy() {
@@ -154,6 +183,8 @@ export function createPeerConnection(
 		handleSignal,
 		sendFile,
 		destroy,
-		get connected() { return dataChannel?.readyState === 'open'; }
+		get connected() {
+			return dataChannel?.readyState === 'open';
+		}
 	};
 }

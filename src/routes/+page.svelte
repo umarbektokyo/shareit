@@ -1,30 +1,61 @@
 <script lang="ts">
 	import { createSignaling, type SignalMessage } from '$lib/signaling';
 	import { createPeerConnection, type TransferProgress, type FileMetadata } from '$lib/peer';
-	import { onMount } from 'svelte';
+	import { SpeedTracker } from '$lib/speed';
+	import { isStreamSaveSupported, createFileWriter } from '$lib/stream-saver';
 
 	const CHUNK_SIZE = 64 * 1024;
 
 	type State = 'idle' | 'waiting' | 'connecting' | 'connected' | 'disconnected';
 
+	interface QueueItem {
+		name: string;
+		size: number;
+		status: 'pending' | 'sending' | 'done';
+		sent: number;
+	}
+
+	interface ReceivedFile {
+		name: string;
+		url: string;
+		size: number;
+		blob: Blob | null; // kept for save-to-disk; null after saving
+	}
+
 	let state = $state<State>('idle');
 	let roomCode = $state('');
 	let joinInput = $state('');
 	let error = $state('');
-	let receivedFiles = $state<{ name: string; url: string; size: number }[]>([]);
-	let sendProgress = $state<TransferProgress | null>(null);
+	let receivedFiles = $state<ReceivedFile[]>([]);
 	let recvProgress = $state<TransferProgress | null>(null);
+	let recvSpeed = $state(0);
 	let isDragging = $state(false);
 	let relayMode = $state(false);
+	let canSaveToDisk = $state(false);
+
+	// Send queue state
+	let sendQueue = $state<{ items: QueueItem[]; totalBytes: number; totalSent: number } | null>(null);
+	let sendSpeed = $state(0);
 
 	let signaling: ReturnType<typeof createSignaling> | null = null;
 	let peer: ReturnType<typeof createPeerConnection> | null = null;
 	let isInitiator = false;
 
+	// Speed trackers
+	const sendSpeedTracker = new SpeedTracker();
+	const recvSpeedTracker = new SpeedTracker();
+
 	// Relay receive state
 	let relayMeta: FileMetadata | null = null;
-	let relayChunks: ArrayBuffer[] = [];
+	let relayChunks: (Blob | ArrayBuffer)[] = [];
 	let relayReceived = 0;
+	let relayUnflushed = 0;
+	const FLUSH_THRESHOLD = 32 * 1024 * 1024;
+
+	// Check FSAA support on load
+	if (typeof window !== 'undefined') {
+		canSaveToDisk = isStreamSaveSupported();
+	}
 
 	function cleanup() {
 		peer?.destroy();
@@ -37,7 +68,14 @@
 	function handleRelayBinary(data: ArrayBuffer) {
 		relayChunks.push(data);
 		relayReceived += data.byteLength;
+		relayUnflushed += data.byteLength;
+		if (relayUnflushed >= FLUSH_THRESHOLD) {
+			const flushed = new Blob(relayChunks);
+			relayChunks = [flushed];
+			relayUnflushed = 0;
+		}
 		if (relayMeta) {
+			recvSpeed = recvSpeedTracker.update(relayReceived);
 			recvProgress = { fileName: relayMeta.name, total: relayMeta.size, received: relayReceived, done: false };
 		}
 	}
@@ -59,7 +97,6 @@
 						() => { state = 'connected'; },
 						() => { state = 'disconnected'; },
 						() => {
-							// P2P failed — fall back to relay through server
 							relayMode = true;
 							state = 'connected';
 						}
@@ -80,22 +117,25 @@
 			case 'ice-candidate':
 				peer?.handleSignal(msg);
 				break;
-			// Relay file transfer messages
 			case 'relay-meta':
 				relayMeta = { name: msg.name, size: msg.size, mimeType: msg.mimeType };
 				relayChunks = [];
 				relayReceived = 0;
+				relayUnflushed = 0;
+				recvSpeedTracker.reset();
 				recvProgress = { fileName: msg.name, total: msg.size, received: 0, done: false };
 				break;
 			case 'relay-end':
 				if (relayMeta) {
 					const blob = new Blob(relayChunks, { type: relayMeta.mimeType || 'application/octet-stream' });
 					const file = new File([blob], relayMeta.name, { type: blob.type });
-					recvProgress = null;
+					recvProgress = { fileName: relayMeta.name, total: relayMeta.size, received: relayMeta.size, done: true };
 					handleReceivedFile(file);
 					relayMeta = null;
 					relayChunks = [];
 					relayReceived = 0;
+					relayUnflushed = 0;
+					setTimeout(() => { recvProgress = null; }, 1500);
 				}
 				break;
 		}
@@ -103,11 +143,36 @@
 
 	function handleReceivedFile(file: File) {
 		const url = URL.createObjectURL(file);
-		receivedFiles = [...receivedFiles, { name: file.name, url, size: file.size }];
+		receivedFiles = [...receivedFiles, { name: file.name, url, size: file.size, blob: file }];
 	}
 
 	function handleRecvProgress(p: TransferProgress) {
-		recvProgress = p.done ? null : p;
+		// Reset speed tracker when a new file starts
+		if (p.received === 0) {
+			recvSpeedTracker.reset();
+		}
+		recvSpeed = recvSpeedTracker.update(p.received);
+		recvProgress = p;
+		if (p.done) {
+			setTimeout(() => { recvProgress = null; }, 1500);
+		}
+	}
+
+	async function saveToDisk(index: number) {
+		const file = receivedFiles[index];
+		if (!file.blob) return;
+		const writer = await createFileWriter(file.name, file.blob.type);
+		if (!writer) return; // user cancelled
+		try {
+			await writer.write(file.blob);
+			await writer.close();
+			// Free the blob and object URL from memory
+			URL.revokeObjectURL(file.url);
+			receivedFiles[index] = { ...file, blob: null, url: '' };
+			receivedFiles = [...receivedFiles];
+		} catch {
+			try { await writer.close(); } catch { /* ignore */ }
+		}
 	}
 
 	async function createRoom() {
@@ -131,7 +196,7 @@
 		signaling.send({ type: 'join', code });
 	}
 
-	async function sendFileViaRelay(file: File) {
+	async function sendFileViaRelay(file: File, onProgress: (p: TransferProgress) => void) {
 		if (!signaling?.ready) return;
 		signaling.send({ type: 'relay-meta', name: file.name, size: file.size, mimeType: file.type });
 
@@ -141,7 +206,7 @@
 			const buffer = await slice.arrayBuffer();
 			signaling.sendBinary(buffer);
 			offset += buffer.byteLength;
-			// Small yield to avoid blocking the UI
+			onProgress({ fileName: file.name, total: file.size, received: offset, done: false });
 			if (offset % (CHUNK_SIZE * 16) === 0) {
 				await new Promise((r) => setTimeout(r, 0));
 			}
@@ -161,16 +226,38 @@
 			return;
 		}
 		error = '';
-		for (const file of validFiles) {
-			sendProgress = { fileName: file.name, total: file.size, received: 0, done: false };
+
+		const items: QueueItem[] = validFiles.map(f => ({ name: f.name, size: f.size, status: 'pending' as const, sent: 0 }));
+		const totalBytes = validFiles.reduce((sum, f) => sum + f.size, 0);
+		sendQueue = { items, totalBytes, totalSent: 0 };
+
+		for (let i = 0; i < validFiles.length; i++) {
+			sendQueue.items[i] = { ...sendQueue.items[i], status: 'sending' };
+			sendQueue = { ...sendQueue };
+			sendSpeedTracker.reset();
+
+			const file = validFiles[i];
+			const onProgress = (p: TransferProgress) => {
+				sendSpeed = sendSpeedTracker.update(p.received);
+				sendQueue!.items[i] = { ...sendQueue!.items[i], sent: p.received };
+				sendQueue!.totalSent = sendQueue!.items.reduce((s, item) => s + item.sent, 0);
+				sendQueue = { ...sendQueue! };
+			};
+
 			if (relayMode) {
-				await sendFileViaRelay(file);
+				await sendFileViaRelay(file, onProgress);
 			} else {
-				await peer!.sendFile(file);
+				await peer!.sendFile(file, (p) => onProgress(p));
 			}
-			sendProgress = { fileName: file.name, total: file.size, received: file.size, done: true };
-			setTimeout(() => { sendProgress = null; }, 1500);
+
+			sendQueue.items[i] = { ...sendQueue.items[i], status: 'done', sent: file.size };
+			sendQueue.totalSent = sendQueue.items.reduce((s, item) => s + item.sent, 0);
+			sendQueue = { ...sendQueue };
 		}
+
+		await new Promise((r) => setTimeout(r, 2000));
+		sendQueue = null;
+		sendSpeed = 0;
 	}
 
 	function onDrop(e: DragEvent) {
@@ -191,13 +278,26 @@
 		return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 	}
 
+	function formatSpeed(bytesPerSec: number): string {
+		if (bytesPerSec <= 0) return '';
+		if (bytesPerSec < 1024) return `${bytesPerSec.toFixed(0)} B/s`;
+		if (bytesPerSec < 1024 * 1024) return `${(bytesPerSec / 1024).toFixed(1)} KB/s`;
+		return `${(bytesPerSec / (1024 * 1024)).toFixed(1)} MB/s`;
+	}
+
 	function disconnect() {
 		cleanup();
 		state = 'idle';
 		roomCode = '';
 		joinInput = '';
+		// Revoke all object URLs
+		for (const f of receivedFiles) {
+			if (f.url) URL.revokeObjectURL(f.url);
+		}
 		receivedFiles = [];
-		sendProgress = null;
+		sendQueue = null;
+		sendSpeed = 0;
+		recvSpeed = 0;
 		recvProgress = null;
 	}
 
@@ -338,7 +438,8 @@
 						<path d="M12 3v12M8 11l4 4 4-4" stroke="#555" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
 						<path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2" stroke="#555" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
 					</svg>
-					<p>Drop files here or click to select</p>
+					<p class="drop-text-desktop">Drop files here or click to select</p>
+					<p class="drop-text-mobile">Tap to select files</p>
 					<input
 						type="file"
 						multiple
@@ -347,27 +448,70 @@
 					/>
 				</div>
 
-				<!-- Transfer progress -->
-				{#if sendProgress}
-					<div class="progress-bar-wrap">
-						<div class="progress-label">
+				<!-- Send queue -->
+				{#if sendQueue}
+					{@const overallPct = sendQueue.totalBytes > 0 ? Math.round((sendQueue.totalSent / sendQueue.totalBytes) * 100) : 0}
+					{@const allDone = sendQueue.items.every(i => i.status === 'done')}
+					<div class="queue-wrap">
+						<div class="queue-header">
 							<svg width="11" height="11" viewBox="0 0 11 11"><path d="M5.5 1v6M3 5l2.5 2.5L8 5" stroke="#4b76c2" stroke-width="1.1" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
-							Sending: {sendProgress.fileName}
+							{#if allDone}
+								<span class="transfer-done">Sent {sendQueue.items.length} file{sendQueue.items.length > 1 ? 's' : ''}</span>
+							{:else}
+								<span>Sending {sendQueue.items.length} file{sendQueue.items.length > 1 ? 's' : ''}</span>
+							{/if}
+							<span class="progress-stats">
+								{formatSize(sendQueue.totalSent)} / {formatSize(sendQueue.totalBytes)} · {overallPct}%{#if sendSpeed > 0 && !allDone} · {formatSpeed(sendSpeed)}{/if}
+							</span>
 						</div>
 						<div class="progress-track">
-							<div class="progress-fill" style="width: {sendProgress.done ? 100 : 0}%"></div>
+							<div class="progress-fill" class:done={allDone} style="width: {overallPct}%"></div>
 						</div>
+						{#if sendQueue.items.length > 1}
+							<div class="queue-items">
+								{#each sendQueue.items as item}
+									<div class="queue-item" class:active={item.status === 'sending'} class:done={item.status === 'done'}>
+										<span class="queue-icon">
+											{#if item.status === 'done'}
+												<svg width="10" height="10" viewBox="0 0 16 16" fill="none"><path d="M4 8l3 3 5-6" stroke="#27ae60" stroke-width="1.8" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+											{:else if item.status === 'sending'}
+												<svg width="10" height="10" viewBox="0 0 11 11"><path d="M5.5 1v6M3 5l2.5 2.5L8 5" stroke="#4b76c2" stroke-width="1.1" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+											{:else}
+												<span class="queue-dot"></span>
+											{/if}
+										</span>
+										<span class="file-name">{item.name}</span>
+										<span class="file-size">
+											{#if item.status === 'sending'}
+												{formatSize(item.sent)} / {formatSize(item.size)}
+											{:else}
+												{formatSize(item.size)}
+											{/if}
+										</span>
+									</div>
+								{/each}
+							</div>
+						{/if}
 					</div>
 				{/if}
 
+				<!-- Receive progress -->
 				{#if recvProgress}
+					{@const pct = Math.round((recvProgress.received / recvProgress.total) * 100)}
 					<div class="progress-bar-wrap">
 						<div class="progress-label">
 							<svg width="11" height="11" viewBox="0 0 11 11"><path d="M5.5 10V4M3 6l2.5-2.5L8 6" stroke="#27ae60" stroke-width="1.1" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
-							Receiving: {recvProgress.fileName} ({Math.round((recvProgress.received / recvProgress.total) * 100)}%)
+							{#if recvProgress.done}
+								<span class="transfer-done">Received: {recvProgress.fileName}</span>
+							{:else}
+								Receiving: {recvProgress.fileName}
+							{/if}
+							<span class="progress-stats">
+								{formatSize(recvProgress.received)} / {formatSize(recvProgress.total)} · {pct}%{#if recvSpeed > 0 && !recvProgress.done} · {formatSpeed(recvSpeed)}{/if}
+							</span>
 						</div>
 						<div class="progress-track">
-							<div class="progress-fill recv" style="width: {(recvProgress.received / recvProgress.total) * 100}%"></div>
+							<div class="progress-fill recv" class:done={recvProgress.done} style="width: {pct}%"></div>
 						</div>
 					</div>
 				{/if}
@@ -380,16 +524,36 @@
 								<path d="M2 4.5h5l1.5-2H14v10H2z" stroke="#5a9fd4" stroke-width="1.1" fill="#5a9fd4" fill-opacity="0.1"/>
 							</svg>
 							<span>Received Files</span>
+							<span class="file-count">{receivedFiles.length}</span>
 						</div>
-						{#each receivedFiles as file}
-							<a href={file.url} download={file.name} class="file-item">
-								<svg width="12" height="12" viewBox="0 0 16 16" fill="none">
-									<rect x="3" y="1.5" width="10" height="13" rx="1.5" stroke="#888" stroke-width="1"/>
-									<path d="M5.5 5.5h5M5.5 8h5M5.5 10.5h3" stroke="#666" stroke-width="0.8" stroke-linecap="round"/>
-								</svg>
-								<span class="file-name">{file.name}</span>
-								<span class="file-size">{formatSize(file.size)}</span>
-							</a>
+						{#each receivedFiles as file, idx}
+							{#if file.blob === null && !file.url}
+								<div class="file-item no-link saved">
+									<svg width="12" height="12" viewBox="0 0 16 16" fill="none">
+										<path d="M4 8l3 3 5-6" stroke="#27ae60" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+									</svg>
+									<span class="file-name">{file.name}</span>
+									<span class="file-size saved-label">Saved to disk</span>
+								</div>
+							{:else}
+								<div class="file-item-row">
+									<a href={file.url} download={file.name} class="file-item">
+										<svg width="12" height="12" viewBox="0 0 16 16" fill="none">
+											<rect x="3" y="1.5" width="10" height="13" rx="1.5" stroke="#888" stroke-width="1"/>
+											<path d="M5.5 5.5h5M5.5 8h5M5.5 10.5h3" stroke="#666" stroke-width="0.8" stroke-linecap="round"/>
+										</svg>
+										<span class="file-name">{file.name}</span>
+										<span class="file-size">{formatSize(file.size)}</span>
+									</a>
+									{#if canSaveToDisk}
+										<button class="save-btn" onclick={() => saveToDisk(idx)} title="Save to disk">
+											<svg width="11" height="11" viewBox="0 0 16 16" fill="none">
+												<path d="M3 14h10M8 2v9M5 8l3 3 3-3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
+											</svg>
+										</button>
+									{/if}
+								</div>
+							{/if}
 						{/each}
 					</div>
 				{/if}
@@ -417,11 +581,30 @@
 									</svg>
 									<span>Received Files</span>
 								</div>
-								{#each receivedFiles as file}
-									<a href={file.url} download={file.name} class="file-item">
-										<span class="file-name">{file.name}</span>
-										<span class="file-size">{formatSize(file.size)}</span>
-									</a>
+								{#each receivedFiles as file, idx}
+									{#if file.blob === null && !file.url}
+										<div class="file-item no-link saved">
+											<svg width="12" height="12" viewBox="0 0 16 16" fill="none">
+												<path d="M4 8l3 3 5-6" stroke="#27ae60" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+											</svg>
+											<span class="file-name">{file.name}</span>
+											<span class="file-size saved-label">Saved to disk</span>
+										</div>
+									{:else}
+										<div class="file-item-row">
+											<a href={file.url} download={file.name} class="file-item">
+												<span class="file-name">{file.name}</span>
+												<span class="file-size">{formatSize(file.size)}</span>
+											</a>
+											{#if canSaveToDisk}
+												<button class="save-btn" onclick={() => saveToDisk(idx)} title="Save to disk">
+													<svg width="11" height="11" viewBox="0 0 16 16" fill="none">
+														<path d="M3 14h10M8 2v9M5 8l3 3 3-3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
+													</svg>
+												</button>
+											{/if}
+										</div>
+									{/if}
 								{/each}
 							</div>
 						{/if}
@@ -670,6 +853,8 @@
 		display: flex;
 		flex-direction: column;
 		padding: 0;
+		overflow-y: auto;
+		min-height: 0;
 	}
 
 	.status-bar {
@@ -730,34 +915,88 @@
 		opacity: 0;
 		cursor: pointer;
 	}
-
-	/* === Progress === */
-	.progress-bar-wrap {
-		padding: 0 16px;
-		margin-bottom: 8px;
+	.drop-text-mobile {
+		display: none;
 	}
-	.progress-label {
+
+	/* === Progress & Queue === */
+	.progress-bar-wrap, .queue-wrap {
+		padding: 10px 14px;
+		margin: 0 16px 8px;
+		background: #2a2a2a;
+		border-radius: 8px;
+		border: 1px solid #1a1a1a;
+	}
+	.progress-label, .queue-header {
 		display: flex;
 		align-items: center;
 		gap: 5px;
 		font-size: 10.5px;
 		color: #aaa;
-		margin-bottom: 4px;
+		margin-bottom: 6px;
+		min-width: 0;
+		overflow: hidden;
+		white-space: nowrap;
+		text-overflow: ellipsis;
+	}
+	.progress-stats {
+		margin-left: auto;
+		color: #777;
+		font-size: 10px;
+		font-variant-numeric: tabular-nums;
+		flex-shrink: 0;
+	}
+	.transfer-done {
+		color: #27ae60;
 	}
 	.progress-track {
-		height: 4px;
+		height: 6px;
 		background: #1e1e1e;
-		border-radius: 2px;
+		border-radius: 3px;
 		overflow: hidden;
 	}
 	.progress-fill {
 		height: 100%;
 		background: #4b76c2;
-		border-radius: 2px;
-		transition: width 0.2s;
+		border-radius: 3px;
+		transition: width 0.15s;
 	}
 	.progress-fill.recv {
 		background: #27ae60;
+	}
+	.progress-fill.done {
+		background: #27ae60;
+	}
+	.queue-items {
+		margin-top: 8px;
+		max-height: 180px;
+		overflow-y: auto;
+		display: flex;
+		flex-direction: column;
+		gap: 1px;
+	}
+	.queue-item {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		padding: 4px 0;
+		font-size: 10.5px;
+		color: #777;
+	}
+	.queue-item.active { color: #ccc; }
+	.queue-item.done { color: #888; }
+	.queue-icon {
+		width: 14px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		flex-shrink: 0;
+	}
+	.queue-dot {
+		width: 4px;
+		height: 4px;
+		background: #555;
+		border-radius: 50%;
 	}
 
 	/* === File list === */
@@ -803,19 +1042,70 @@
 		font-size: 10px;
 		flex-shrink: 0;
 	}
+	.file-count {
+		margin-left: auto;
+		background: #444;
+		color: #aaa;
+		font-size: 9px;
+		padding: 1px 6px;
+		border-radius: 8px;
+	}
+	.file-item.no-link {
+		cursor: default;
+	}
+	.file-item.no-link:hover {
+		background: transparent;
+	}
+	.file-item-row {
+		display: flex;
+		align-items: center;
+		border-bottom: 1px solid #222;
+	}
+	.file-item-row:last-child { border-bottom: none; }
+	.file-item-row .file-item {
+		flex: 1;
+		border-bottom: none;
+	}
+	.save-btn {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		width: 28px;
+		height: 28px;
+		margin-right: 6px;
+		background: #3a3a3a;
+		border: none;
+		border-radius: 5px;
+		color: #999;
+		cursor: pointer;
+		transition: background 0.08s, color 0.08s;
+		flex-shrink: 0;
+	}
+	.save-btn:hover { background: #4b76c2; color: #fff; }
+	.file-item.saved {
+		color: #999;
+	}
+	.saved-label {
+		color: #27ae60;
+		font-size: 10px;
+	}
 
 	/* === Mobile === */
 	@media (max-width: 480px) {
 		:global(body) {
 			font-size: 14px;
 		}
-		.header {
-			height: 44px;
-			padding: 0 14px;
+		.app {
+			padding-top: env(safe-area-inset-top);
+			padding-bottom: env(safe-area-inset-bottom);
 		}
-		.header-title { font-size: 14px; }
+		.header {
+			height: 48px;
+			padding: 0 16px;
+		}
+		.header-title { font-size: 15px; }
 		.header-sub { font-size: 12px; }
-		.btn-sm { padding: 6px 14px; font-size: 13px; }
+		.btn-sm { padding: 8px 14px; font-size: 13px; }
 
 		.center-panel {
 			align-items: flex-start;
@@ -825,65 +1115,83 @@
 			width: 100%;
 		}
 		.panel-header {
-			height: 36px;
-			font-size: 13px;
+			height: 40px;
+			font-size: 14px;
 			padding: 0 14px;
 		}
 		.panel-body {
 			padding: 20px 16px;
-			gap: 14px;
+			gap: 16px;
 		}
-		.hint { font-size: 13px; }
+		.hint { font-size: 14px; }
 
 		.bw {
-			font-size: 14px;
-			padding: 10px 16px;
-			border-radius: 8px;
+			font-size: 15px;
+			padding: 12px 16px;
+			border-radius: 10px;
 		}
-		.btn-full { padding: 12px 16px; }
+		.btn-full { padding: 14px 16px; }
 
 		.input {
 			font-size: 16px;
-			padding: 10px 14px;
+			padding: 12px 14px;
+			border-radius: 10px;
 		}
-		.input::placeholder { font-size: 13px; }
+		.input::placeholder { font-size: 14px; }
 
 		.divider { font-size: 12px; }
 
-		.code-display { padding: 14px; }
-		.code-text { font-size: 26px; letter-spacing: 8px; }
-		.icon-sq { width: 36px; height: 36px; }
+		.code-display { padding: 16px; border-radius: 10px; }
+		.code-text { font-size: 28px; letter-spacing: 8px; }
+		.icon-sq { width: 40px; height: 40px; border-radius: 10px; }
 		.copy-icon { width: 18px; height: 18px; }
 
-		.spinner-row { font-size: 13px; gap: 10px; }
-		.spinner { width: 16px; height: 16px; }
+		.spinner-row { font-size: 14px; gap: 10px; }
+		.spinner { width: 18px; height: 18px; }
 
-		.error-msg { font-size: 13px; padding: 8px 12px; }
+		.error-msg { font-size: 13px; padding: 10px 12px; border-radius: 8px; }
 
 		.status-bar {
-			height: 36px;
+			height: 40px;
 			font-size: 13px;
-			padding: 0 14px;
+			padding: 0 16px;
 		}
 		.status-dot { width: 9px; height: 9px; }
 		.status-code { font-size: 12px; }
 
 		.drop-zone {
 			margin: 12px;
-			min-height: 180px;
-			font-size: 14px;
+			min-height: 160px;
+			font-size: 15px;
 			gap: 12px;
+			border-radius: 12px;
+			border-width: 2px;
+		}
+		.drop-text-desktop { display: none; }
+		.drop-text-mobile { display: block; }
+
+		.progress-bar-wrap, .queue-wrap {
+			padding: 12px;
+			margin: 0 12px 8px;
 			border-radius: 10px;
 		}
+		.progress-label, .queue-header {
+			font-size: 13px;
+			gap: 6px;
+			flex-wrap: wrap;
+			white-space: normal;
+		}
+		.progress-stats { font-size: 11px; }
+		.progress-track { height: 8px; border-radius: 4px; }
+		.queue-items { max-height: 200px; }
+		.queue-item { padding: 8px 0; font-size: 13px; }
 
-		.progress-bar-wrap { padding: 0 12px; margin-bottom: 10px; }
-		.progress-label { font-size: 13px; gap: 6px; }
-		.progress-track { height: 6px; border-radius: 3px; }
-
-		.file-list { margin: 0 12px 12px; border-radius: 8px; }
-		.file-list-header { font-size: 13px; padding: 10px 14px; }
-		.file-item { padding: 12px 14px; gap: 10px; }
-		.file-name { font-size: 13px; }
+		.file-list { margin: 0 12px 12px; border-radius: 10px; }
+		.file-list-header { font-size: 13px; padding: 12px 14px; }
+		.file-count { font-size: 10px; padding: 2px 7px; }
+		.file-item { padding: 14px; gap: 10px; }
+		.save-btn { width: 36px; height: 36px; margin-right: 10px; border-radius: 8px; }
+		.file-name { font-size: 14px; }
 		.file-size { font-size: 12px; }
 	}
 </style>
